@@ -1,3 +1,4 @@
+#include <dlfcn.h>
 #include <map>
 
 #include "Argument.h"
@@ -32,6 +33,19 @@ struct CallableContents {
     // Encoded values for complete runtime type checking, used
     // only for make_std_function. Lazily created.
     std::vector<Callable::FullCallCheckInfo> full_call_check_info;
+
+    // AOT mode: when `aot_argv_fn` is non-null, `call_argv_fast` routes
+    // through it instead of `jit_cache.call_jit_code`. The argv calling
+    // convention is identical between JIT-wrapped and AOT-loaded entry
+    // points. Populated by `Callable::load_aot()`. Owns the dlopen handle.
+    void *aot_dl_handle = nullptr;
+    int (*aot_argv_fn)(const void *const *) = nullptr;
+
+    ~CallableContents() {
+        if (aot_dl_handle) {
+            dlclose(aot_dl_handle);
+        }
+    }
 };
 
 namespace Internal {
@@ -73,6 +87,78 @@ Callable::Callable(const std::string &name,
     }
 
     // Don't create full_call_check_info yet.
+}
+
+Callable::Callable(LoadAOTContents &&loaded)
+    : contents(new CallableContents) {
+    contents->name = std::move(loaded.name);
+    contents->aot_dl_handle = loaded.dl_handle;
+    contents->aot_argv_fn = loaded.argv_fn;
+
+    // We populate just the bits of jit_cache that `call_argv_fast` and
+    // `arguments()` actually read: target (for the UserContext assertion)
+    // and arguments (for the user-facing accessor and quick_call_check_info).
+    // The jit_module / wasm_module stay default-constructed; the AOT path
+    // doesn't touch them.
+    contents->jit_cache.jit_target = std::move(loaded.target);
+    contents->jit_cache.arguments = std::move(loaded.arguments);
+
+    contents->quick_call_check_info.reserve(contents->jit_cache.arguments.size());
+    for (const Argument &a : contents->jit_cache.arguments) {
+        const auto qcci = (a.name == "__user_context") ?
+                              Callable::make_ucon_qcci() :
+                              (a.is_scalar() ? Callable::make_scalar_qcci(a.type) : Callable::make_buffer_qcci());
+        contents->quick_call_check_info.push_back(qcci);
+    }
+}
+
+/*static*/ Callable Callable::load_aot(const std::string &so_path,
+                                       const std::string &symbol_name,
+                                       const std::vector<Argument> &args,
+                                       const Target &target) {
+    user_assert(target.has_feature(Target::UserContext))
+        << "Callable::load_aot requires the AOT .so to have been compiled with "
+        << "Target::UserContext; supplied target was " << target.to_string();
+
+    void *handle = dlopen(so_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!handle) {
+        const char *err = dlerror();
+        user_error << "Callable::load_aot: dlopen(\"" << so_path << "\") failed: "
+                   << (err ? err : "(no dlerror)");
+    }
+
+    const std::string fn_name = symbol_name + "_argv";
+    // dlerror() must be cleared before dlsym so we can detect "found but null":
+    (void)dlerror();
+    void *sym = dlsym(handle, fn_name.c_str());
+    if (const char *err = dlerror()) {
+        dlclose(handle);
+        user_error << "Callable::load_aot: dlsym(\"" << fn_name << "\") failed in "
+                   << so_path << ": " << err;
+    }
+    if (!sym) {
+        dlclose(handle);
+        user_error << "Callable::load_aot: dlsym(\"" << fn_name << "\") returned null in " << so_path;
+    }
+
+    // Prepend __user_context so the schema agrees with the AOT entry point's
+    // argv layout (Halide's lowering pass adds this slot when the target has
+    // Target::UserContext, which we required above).
+    std::vector<Argument> full_args;
+    full_args.reserve(args.size() + 1);
+    full_args.emplace_back("__user_context", Argument::InputScalar, type_of<const void *>(), 0, ArgumentEstimates{});
+    for (const auto &a : args) {
+        full_args.push_back(a);
+    }
+
+    LoadAOTContents loaded{
+        symbol_name,
+        handle,
+        reinterpret_cast<int (*)(const void *const *)>(sym),
+        target,
+        std::move(full_args),
+    };
+    return Callable(std::move(loaded));
 }
 
 const std::vector<Argument> &Callable::arguments() const {
@@ -192,10 +278,20 @@ Callable::FailureFn Callable::check_fcci(size_t argc, const FullCallCheckInfo *a
 
     JITFuncCallContext jit_call_context(context, contents->saved_jit_handlers);
 
-    int exit_status = contents->jit_cache.call_jit_code(argv);
-
-    // If we're profiling, report runtimes and reset profiler stats.
-    contents->jit_cache.finish_profiling(context);
+    int exit_status;
+    if (contents->aot_argv_fn) {
+        // AOT path: invoke the dlsym'd `<name>_argv`. Same calling convention
+        // as the JIT path's argv_wrapper -- buffer args are halide_buffer_t*,
+        // scalar args are by-pointer, argv[0] is JITUserContext**.
+        exit_status = contents->aot_argv_fn(argv);
+    } else {
+        exit_status = contents->jit_cache.call_jit_code(argv);
+        // If we're profiling, report runtimes and reset profiler stats.
+        // (AOT profiling-symbol resolution is not implemented; AOT pipelines
+        // that need profiler integration should dlsym halide_profiler_report
+        // separately.)
+        contents->jit_cache.finish_profiling(context);
+    }
 
     jit_call_context.finalize(exit_status);
 

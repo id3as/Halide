@@ -278,6 +278,18 @@ private:
              const std::map<std::string, JITExtern> &jit_externs,
              Internal::JITCache &&jit_cache);
 
+    // Private constructor used by load_aot() — wraps a pre-compiled .so
+    // function pointer instead of JIT-generated code. The dl handle is
+    // owned by the resulting Callable and dlclose'd on destruction.
+    struct LoadAOTContents {
+        std::string name;
+        void *dl_handle;
+        int (*argv_fn)(const void *const *);
+        Target target;
+        std::vector<Argument> arguments;  // Inputs + outputs in argv order
+    };
+    explicit Callable(LoadAOTContents &&contents);
+
     // Note that the first entry in argv must always be a JITUserContext*.
     int call_argv_checked(size_t argc, const void *const *argv, const QuickCallCheckInfo *actual_cci) const;
 
@@ -403,6 +415,34 @@ public:
      *
      */
     int call_argv_fast(size_t argc, const void *const *argv) const;
+
+    /** Load a pre-compiled AOT-generated `.so` and wrap its `<name>_argv`
+     * entry point as a Callable. The argv calling convention is identical
+     * between JIT-via-Callable and AOT (the `call_argv_fast` doc above
+     * documents both), so a `.so` produced by `compile_to_static_library()`
+     * (or similar) is invokable through the same `operator()` /
+     * `make_std_function()` / `call_argv_fast()` API as a JIT Callable.
+     *
+     * Required: the .so must have been compiled with `Target::UserContext`
+     * (so its argv expects a `JITUserContext**` slot at argv[0]); supply
+     * the matching `target` to `args.front()` such that
+     * `target.has_feature(Target::UserContext)` is true.
+     *
+     * The caller-supplied `args` must list inputs + outputs in the exact
+     * order the AOT compile saw them (matching what
+     * `Pipeline::infer_arguments()` returned at compile time, with outputs
+     * appended). Do NOT include the `__user_context` slot in `args`; it is
+     * inserted automatically.
+     *
+     * The Callable owns the dlopen handle for the loaded `.so`; the handle
+     * is `dlclose`d when the last reference to the Callable is dropped.
+     *
+     * Throws `Halide::RuntimeError` if dlopen / dlsym fails or if `target`
+     * is missing `Target::UserContext`. */
+    static Callable load_aot(const std::string &so_path,
+                             const std::string &symbol_name,
+                             const std::vector<Argument> &args,
+                             const Target &target);
 };
 
 }  // namespace Halide
