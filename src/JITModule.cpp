@@ -1017,6 +1017,42 @@ JITModule &make_module(llvm::Module *for_module, Target target,
 
         runtime.compile_module(std::move(module), "", target, deps, halide_exports);
 
+        // id3as: unify the CUDA runtime identity with a process-exported
+        // runtime when one exists. A host process may deliberately export a
+        // strong halide_cuda_* family (e.g. an embedded standalone runtime
+        // that AOT NoRuntime .so's resolve against). Host code reaching the
+        // runtime through normal linkage binds that copy, while JIT-compiled
+        // pipelines bind this module's own weak definitions — except that on
+        // some 64-bit JITLink backends (x86_64) the process symbol wins weak
+        // coalescing while on others (aarch64) the module-local copy wins.
+        // Two live runtime instances mean two halide_device_interface_t
+        // identities, and halide_copy_to_device rejects buffers across them
+        // ("does not support switching interfaces") nondeterministically by
+        // arch and call path. Redirect this module's halide_cuda_* exports
+        // to the process copy when the process exports one: both the host
+        // lookup (lookup_runtime_routine) and every dependent pipeline's
+        // absolute symbols read this exports map, so all consumers bind ONE
+        // runtime — deterministically, on every arch. The halide_set_cuda_*
+        // hook installers don't match the prefix and stay module-local.
+        // Processes that don't export the family (no dlsym hit) see no
+        // change.
+        if (runtime_kind == CUDA || runtime_kind == CUDADebug) {
+            for (auto &exp : runtime.jit_module->exports) {
+                const std::string &name = exp.first;
+                if (!starts_with(name, "halide_cuda_")) {
+                    continue;
+                }
+                if (void *process_addr = get_symbol_address(name.c_str())) {
+                    if (process_addr != exp.second.address) {
+                        debug(1) << "JIT CUDA runtime: binding " << name
+                                 << " to process-exported copy at " << process_addr
+                                 << " (was " << exp.second.address << ")\n";
+                        exp.second.address = process_addr;
+                    }
+                }
+            }
+        }
+
         if (runtime_kind == MainShared) {
             runtime_internal_handlers.custom_print =
                 hook_function(runtime.exports(), "halide_set_custom_print", print_handler);
