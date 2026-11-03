@@ -959,7 +959,14 @@ public:
     Stmt rewrap_kernel_launch(Stmt s, const ExtractBlockSize &bs, DeviceAPI device_api) {
 
         for (const auto &alloc : global_allocations) {
-            Expr total_size = alloc.size;
+            // A size computed on the host is the max over the uses the
+            // preamble replays, so it is zero when the replay reaches no use
+            // on this launch: a loop around every use runs zero times, e.g.
+            // a reduction with a runtime extent of zero, or a use under a
+            // specialization whose condition is false. The device runtimes
+            // reject a zero-byte allocation, and the buffer must still exist
+            // to be bound as a kernel argument, so allocate one element.
+            Expr total_size = max(alloc.size, 1);
 
             Expr device_interface = make_device_interface_call(device_api);
             string buffer_name = alloc.name + ".buffer";
