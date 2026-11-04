@@ -316,6 +316,9 @@ WEAK mtl_command_queue *queue;
 struct device_handle {
     mtl_buffer *buf;
     uint64_t offset;
+    // id3as: set by halide_metal_wrap_buffer_with_offset, which retains buf,
+    // so that halide_metal_detach_buffer releases it.
+    bool release_on_detach;
 };
 
 WEAK Halide::Internal::GPUCompilationCache<mtl_device *, mtl_library *> compilation_cache;
@@ -647,6 +650,7 @@ WEAK int halide_metal_device_malloc(void *user_context, halide_buffer_t *buf) {
 
     handle->buf = metal_buf;
     handle->offset = 0;
+    handle->release_on_detach = false;
 
     buf->device = (uint64_t)handle;
     buf->device_interface = &metal_device_interface;
@@ -1225,6 +1229,7 @@ WEAK int metal_device_crop_from_offset(void *user_context,
     retain_ns_object(((device_handle *)src->device)->buf);
     new_handle->buf = ((device_handle *)src->device)->buf;
     new_handle->offset = ((device_handle *)src->device)->offset + offset;
+    new_handle->release_on_detach = false;
     dst->device = (uint64_t)new_handle;
     return halide_error_code_success;
 }
@@ -1286,10 +1291,24 @@ WEAK int halide_metal_wrap_buffer(void *user_context, struct halide_buffer_t *bu
     }
     handle->buf = (mtl_buffer *)buffer;
     handle->offset = 0;
+    handle->release_on_detach = false;
 
     buf->device = (uint64_t)handle;
     buf->device_interface = &metal_device_interface;
     buf->device_interface->impl->use_module();
+    return halide_error_code_success;
+}
+
+WEAK int halide_metal_wrap_buffer_with_offset(void *user_context, struct halide_buffer_t *buf,
+                                              uint64_t buffer, uint64_t offset) {
+    int result = halide_metal_wrap_buffer(user_context, buf, buffer);
+    if (result != halide_error_code_success) {
+        return result;
+    }
+    device_handle *handle = (device_handle *)buf->device;
+    handle->offset = offset;
+    handle->release_on_detach = true;
+    retain_ns_object(handle->buf);
     return halide_error_code_success;
 }
 
@@ -1301,9 +1320,13 @@ WEAK int halide_metal_detach_buffer(void *user_context, struct halide_buffer_t *
         error(user_context) << "halide_metal_detach_buffer: device is not metal.";
         return halide_error_code_generic_error;
     }
+    device_handle *handle = (device_handle *)buf->device;
+    if (handle->release_on_detach) {
+        release_ns_object(handle->buf);
+    }
     buf->device_interface->impl->release_module();
     buf->device_interface = nullptr;
-    free((device_handle *)buf->device);
+    free(handle);
     buf->device = 0;
     return halide_error_code_success;
 }

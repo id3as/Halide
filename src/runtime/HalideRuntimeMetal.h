@@ -47,6 +47,19 @@ extern int halide_metal_run(void *user_context,
  * are left unmodified. */
 extern int halide_metal_wrap_buffer(void *user_context, struct halide_buffer_t *buf, uint64_t buffer);
 
+/** Like halide_metal_wrap_buffer, but the halide_buffer_t's data starts
+ * offset bytes into the MTLBuffer (e.g. one plane of a multi-planar
+ * allocation), and the MTLBuffer is retained until
+ * halide_metal_detach_buffer, which releases it. The offset must meet Metal's
+ * buffer-binding alignment for the kernels' element types. */
+extern int halide_metal_wrap_buffer_with_offset(void *user_context, struct halide_buffer_t *buf,
+                                                uint64_t buffer, uint64_t offset);
+
+/** Wait until every command buffer committed to this runtime's queue has
+ * completed (the queue runs them in commit order). buf may be null; if not,
+ * a managed MTLBuffer behind it is also synchronized for the host. */
+extern int halide_metal_device_sync(void *user_context, struct halide_buffer_t *buf);
+
 /** Disconnect a halide_buffer_t from the memory it was previously
  * wrapped around. Should only be called for a halide_buffer_t that
  * halide_metal_wrap_buffer was previously called on. Frees any
