@@ -60,6 +60,10 @@ extern int halide_metal_wrap_buffer_with_offset(void *user_context, struct halid
  * a managed MTLBuffer behind it is also synchronized for the host. */
 extern int halide_metal_device_sync(void *user_context, struct halide_buffer_t *buf);
 
+/** Release any currently-unused device allocations back to Metal. See
+ * halide_reuse_device_allocations. */
+extern int halide_metal_release_unused_device_allocations(void *user_context);
+
 /** Disconnect a halide_buffer_t from the memory it was previously
  * wrapped around. Should only be called for a halide_buffer_t that
  * halide_metal_wrap_buffer was previously called on. Frees any

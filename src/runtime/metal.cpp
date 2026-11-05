@@ -319,6 +319,12 @@ struct device_handle {
     // id3as: set by halide_metal_wrap_buffer_with_offset, which retains buf,
     // so that halide_metal_detach_buffer releases it.
     bool release_on_detach;
+    // id3as: buf came from the reuse free list, so GPU work queued by its
+    // previous user may still be running. Work queued after it is ordered
+    // behind that, but a host write is not: the first host write waits for
+    // the queue (see halide_metal_device_and_host_malloc and
+    // halide_metal_copy_to_device).
+    bool recycled;
 };
 
 WEAK Halide::Internal::GPUCompilationCache<mtl_device *, mtl_library *> compilation_cache;
@@ -597,6 +603,45 @@ WEAK void command_buffer_completed_handler_invoke(command_buffer_completed_handl
 }  // namespace Runtime
 }  // namespace Halide
 
+namespace Halide {
+namespace Runtime {
+namespace Internal {
+namespace Metal {
+
+// Device allocations freed while halide_can_reuse_device_allocations() is
+// true are kept for reuse, as the CUDA runtime does: a pipeline's
+// intermediates are otherwise new MTLBuffers on every run, which the kernel
+// has to map and zero. A buffer goes back only to the queue it was freed
+// on: Metal tracks hazards on a buffer within a queue, so a kernel still in
+// flight on that queue finishes with the buffer before the next user's work
+// runs, but it gives no such ordering between queues.
+struct FreeListItem {
+    mtl_buffer *buf;
+    mtl_command_queue *queue;
+    uint64_t size;
+    FreeListItem *next;
+};
+WEAK FreeListItem *free_list = nullptr;
+WEAK halide_mutex free_list_lock;
+
+// Rounds up to the top 4 significant bits, so similar sizes share entries
+// (on average 4% extra memory per allocation).
+ALWAYS_INLINE uint64_t quantize_allocation_size(uint64_t sz) {
+    int z = __builtin_clzll(sz);
+    if (z < 60) {
+        sz--;
+        sz = sz >> (60 - z);
+        sz++;
+        sz = sz << (60 - z);
+    }
+    return sz;
+}
+
+}  // namespace Metal
+}  // namespace Internal
+}  // namespace Runtime
+}  // namespace Halide
+
 using namespace Halide::Runtime::Internal::Metal;
 
 extern "C" {
@@ -610,6 +655,10 @@ WEAK int halide_metal_device_malloc(void *user_context, halide_buffer_t *buf) {
     if (size == 0) {
         error(user_context) << "halide_metal_device_malloc: Failed to allocate buffer of size 0.";
         return halide_error_code_generic_error;
+    }
+    const bool reuse = halide_can_reuse_device_allocations(user_context);
+    if (reuse) {
+        size = quantize_allocation_size(size);
     }
 
     if (buf->device) {
@@ -641,7 +690,57 @@ WEAK int halide_metal_device_malloc(void *user_context, halide_buffer_t *buf) {
         return halide_error_code_out_of_memory;
     }
 
-    mtl_buffer *metal_buf = new_buffer(metal_context.device, size);
+    mtl_buffer *metal_buf = nullptr;
+    FreeListItem *to_free = nullptr;
+    if (reuse) {
+        // Best fit, as in the CUDA runtime: an entry is claimed if the request
+        // is at least 7/8 of its size, and entries more than 32 deep have
+        // gone unused long enough to be released.
+        ScopedMutexLock lock(&free_list_lock);
+        FreeListItem *best = nullptr, *item = free_list;
+        FreeListItem **best_prev = nullptr, **prev_ptr = &free_list;
+        int depth = 0;
+        while (item) {
+            if ((size <= item->size) &&
+                (size >= (item->size / 8) * 7) &&
+                (metal_context.queue == item->queue) &&
+                ((best == nullptr) || (best->size > item->size))) {
+                best = item;
+                best_prev = prev_ptr;
+                prev_ptr = &item->next;
+                item = item->next;
+            } else if (depth > 32) {
+                to_free = item;
+                *prev_ptr = nullptr;
+                item = nullptr;
+                break;
+            } else {
+                prev_ptr = &item->next;
+                item = item->next;
+            }
+            depth++;
+        }
+        if (best) {
+            metal_buf = best->buf;
+            *best_prev = best->next;
+            free(best);
+        }
+    }
+    handle->recycled = metal_buf != nullptr;
+    while (to_free) {
+        FreeListItem *next = to_free->next;
+        release_ns_object(to_free->buf);
+        free(to_free);
+        to_free = next;
+    }
+
+    if (metal_buf == nullptr) {
+        metal_buf = new_buffer(metal_context.device, size);
+        if (metal_buf == nullptr && reuse) {
+            halide_metal_release_unused_device_allocations(user_context);
+            metal_buf = new_buffer(metal_context.device, size);
+        }
+    }
     if (metal_buf == nullptr) {
         free(handle);
         error(user_context) << "Metal: Failed to allocate buffer of size " << (int64_t)size << ".\n";
@@ -681,7 +780,25 @@ WEAK int halide_metal_device_free(void *user_context, halide_buffer_t *buf) {
         return halide_error_code_generic_error;
     }
 
-    release_ns_object(handle->buf);
+    FreeListItem *item = nullptr;
+    if (halide_can_reuse_device_allocations(user_context)) {
+        MetalContextHolder metal_context(user_context, true);
+        if (metal_context.error()) {
+            return metal_context.get_and_clear_error();
+        }
+        item = (FreeListItem *)malloc(sizeof(FreeListItem));
+        if (item != nullptr) {
+            item->buf = handle->buf;
+            item->queue = metal_context.queue;
+            item->size = quantize_allocation_size(buf->size_in_bytes());
+            ScopedMutexLock lock(&free_list_lock);
+            item->next = free_list;
+            free_list = item;
+        }
+    }
+    if (item == nullptr) {
+        release_ns_object(handle->buf);
+    }
     free(handle);
     buf->device = 0;
     buf->device_interface->impl->release_module();
@@ -692,6 +809,22 @@ WEAK int halide_metal_device_free(void *user_context, halide_buffer_t *buf) {
     debug(user_context) << "    Time: " << (t_after - t_before) / 1.0e6 << " ms\n";
 #endif
 
+    return halide_error_code_success;
+}
+
+WEAK int halide_metal_release_unused_device_allocations(void *user_context) {
+    FreeListItem *to_free;
+    {
+        ScopedMutexLock lock(&free_list_lock);
+        to_free = free_list;
+        free_list = nullptr;
+    }
+    while (to_free) {
+        FreeListItem *next = to_free->next;
+        release_ns_object(to_free->buf);
+        free(to_free);
+        to_free = next;
+    }
     return halide_error_code_success;
 }
 
@@ -797,6 +930,7 @@ WEAK int halide_metal_device_release(void *user_context) {
 
     if (acquired_device) {
         halide_metal_device_sync_internal(queue, nullptr);
+        (void)halide_metal_release_unused_device_allocations(user_context);
 
         debug(user_context) << "Calling delete context on device " << acquired_device << "\n";
         compilation_cache.delete_context(user_context, acquired_device, release_ns_object);
@@ -832,6 +966,10 @@ WEAK int halide_metal_copy_to_device(void *user_context, halide_buffer_t *buffer
     }
 
     device_copy c = make_host_to_device_copy(buffer);
+    if (((device_handle *)c.dst)->recycled) {
+        halide_metal_device_sync_internal(metal_context.queue, nullptr);
+        ((device_handle *)c.dst)->recycled = false;
+    }
     mtl_buffer *metal_buffer = ((device_handle *)c.dst)->buf;
     c.dst = (uint64_t)buffer_contents(metal_buffer) + ((device_handle *)c.dst)->offset;
 
@@ -1086,7 +1224,17 @@ WEAK int halide_metal_device_and_host_malloc(void *user_context, struct halide_b
         return result;
     }
 
-    mtl_buffer *metal_buffer = ((device_handle *)(buffer->device))->buf;
+    device_handle *handle = (device_handle *)(buffer->device);
+    if (handle->recycled) {
+        // The host pointer is the buffer itself, written from here on.
+        MetalContextHolder metal_context(user_context, true);
+        if (metal_context.error()) {
+            return metal_context.get_and_clear_error();
+        }
+        halide_metal_device_sync_internal(metal_context.queue, nullptr);
+        handle->recycled = false;
+    }
+    mtl_buffer *metal_buffer = handle->buf;
     buffer->host = (uint8_t *)buffer_contents(metal_buffer);
     debug(user_context) << "halide_metal_device_and_host_malloc"
                         << " device = " << (void *)buffer->device
@@ -1230,6 +1378,7 @@ WEAK int metal_device_crop_from_offset(void *user_context,
     new_handle->buf = ((device_handle *)src->device)->buf;
     new_handle->offset = ((device_handle *)src->device)->offset + offset;
     new_handle->release_on_detach = false;
+    new_handle->recycled = ((device_handle *)src->device)->recycled;
     dst->device = (uint64_t)new_handle;
     return halide_error_code_success;
 }
@@ -1292,6 +1441,7 @@ WEAK int halide_metal_wrap_buffer(void *user_context, struct halide_buffer_t *bu
     handle->buf = (mtl_buffer *)buffer;
     handle->offset = 0;
     handle->release_on_detach = false;
+    handle->recycled = false;
 
     buf->device = (uint64_t)handle;
     buf->device_interface = &metal_device_interface;
@@ -1364,6 +1514,13 @@ namespace Halide {
 namespace Runtime {
 namespace Internal {
 namespace Metal {
+
+WEAK halide_device_allocation_pool metal_allocation_pool;
+
+WEAK __attribute__((constructor)) void register_metal_allocation_pool() {
+    metal_allocation_pool.release_unused = &halide_metal_release_unused_device_allocations;
+    halide_register_device_allocation_pool(&metal_allocation_pool);
+}
 
 WEAK halide_device_interface_impl_t metal_device_interface_impl = {
     halide_use_jit_module,
